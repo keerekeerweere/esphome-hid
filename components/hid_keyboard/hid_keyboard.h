@@ -1,6 +1,7 @@
 #pragma once
 
 #include "keyboard_engine.h"
+#include "layouts.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
 #include "tinyusb.h"
@@ -22,6 +23,15 @@ class HIDKeyboard : public Component {
     device_descriptor_.idProduct = product;
   }
   void set_vbus_monitor_pin(int pin) { vbus_pin_ = pin; }
+  // Host keyboard layout used to translate text and single-character keys.
+  void set_layout(Layout layout) { engine_.set_layout(layout); }
+  bool set_layout_name(const std::string &name) {
+    Layout layout;
+    if (!layout_from_name(name, layout)) return false;
+    engine_.set_layout(layout);
+    return true;
+  }
+  const char *layout_name() const { return esphome::hid_keyboard::layout_name(engine_.layout()); }
   // StringRef is borrowed only for this call; engine copies text synchronously.
   void press(StringRef key, int modifiers) { submit_key_(Operation::PRESS, key, modifiers); }
   void tap(StringRef key, int modifiers) { submit_key_(Operation::TAP, key, modifiers); }

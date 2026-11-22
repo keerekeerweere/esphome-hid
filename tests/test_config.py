@@ -58,7 +58,7 @@ def test_valid_actions(tmp_path):
 @pytest.mark.parametrize(
     ("keyboard", "expected"),
     [
-        ({"layout": "AZERTY_FR"}, "QWERTY_US"),
+        ({"layout": "DVORAK"}, "AZERTY_FR"),
         ({"queue_size": 9}, "8"),
         ({"max_text_length": 1025}, "1024"),
         ({"keypress_duration": "0ms"}, "1ms"),

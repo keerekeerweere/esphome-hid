@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace esphome::hid_keyboard {
 
@@ -19,11 +20,14 @@ static_assert(sizeof(Report) == 8);
 struct Key {
   uint8_t code{0};
   uint8_t modifiers{0};
+  bool letter{false};  // Caps Lock inverts Shift for letter keys.
 };
 
 // Physical US QWERTY mapping. Deliberately rejects every unspecified byte.
 bool ascii_key(uint8_t character, Key &key);
 bool named_key(std::string_view name, Key &key);
+
+enum class Layout : uint8_t;  // Defined in layouts.h.
 
 enum class Result : uint8_t { ACCEPTED, UNAVAILABLE, INVALID_INPUT, TOO_LONG, QUEUE_FULL, CANCELLED, USB_TIMEOUT };
 enum class Operation : uint8_t { PRESS, TAP, TEXT };
@@ -45,6 +49,8 @@ class KeyboardEngine {
   void cancel(Result reason = Result::CANCELLED);
   void set_available(bool available);
   void set_caps_lock(bool enabled) { caps_lock_ = enabled; }
+  void set_layout(Layout layout) { layout_ = layout; }
+  Layout layout() const { return layout_; }
   // Called on every reset/detach/suspend/protocol change, even if mounted has
   // already become true again by the time the main loop observes the event.
   void reset();
@@ -62,7 +68,7 @@ class KeyboardEngine {
   struct Request {
     Operation operation{Operation::PRESS};
     Key key{};
-    std::string text;
+    std::vector<Key> keys;  // TEXT: resolved through the active layout at submit time.
   };
   Result result_(Result result) { return last_result_ = result; }
   bool room_() const { return count_ < queue_limit_; }
@@ -78,6 +84,7 @@ class KeyboardEngine {
   Report current_{}, proposed_{};
   bool available_{false}, neutral_pending_{true}, waiting_{false}, cancelled_inflight_{false}, caps_lock_{false};
   Result last_result_{Result::ACCEPTED};
+  Layout layout_{static_cast<Layout>(0)};  // QWERTY_US
 };
 
 }  // namespace esphome::hid_keyboard

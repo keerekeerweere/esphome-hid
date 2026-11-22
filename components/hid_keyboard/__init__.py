@@ -65,15 +65,16 @@ SPECIAL_KEYS = {
 }
 
 
+LAYOUTS = ("QWERTY_US", "QWERTY_UK", "AZERTY_BE", "AZERTY_FR", "QWERTZ_DE")
+
+
 def text(value):
+    # Characters are checked against the selected layout at runtime; the layout
+    # can change after boot, so only the size is validated here.
     value = cv.string_strict(value)
-    if len(value) > 1024:
+    if len(value.encode("utf-8")) > 1024:
         raise cv.Invalid(
-            "Text is limited to 1024 ASCII bytes (also checked against max_text_length at runtime)"
-        )
-    if any(not (32 <= ord(c) <= 126 or c in "\n\t") for c in value):
-        raise cv.Invalid(
-            "US QWERTY supports printable ASCII, newline and tab only; entire input rejected"
+            "Text is limited to 1024 bytes (also checked against max_text_length at runtime)"
         )
     return value
 
@@ -105,7 +106,7 @@ CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(HIDKeyboard),
-            cv.Optional("layout", default="QWERTY_US"): cv.one_of("QWERTY_US", upper=True),
+            cv.Optional("layout", default="QWERTY_US"): cv.one_of(*LAYOUTS, upper=True),
             cv.Optional("keypress_duration", default="30ms"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(min=cv.TimePeriod(milliseconds=1), max=cv.TimePeriod(seconds=5)),
@@ -150,6 +151,7 @@ async def to_code(config):
             config["queue_size"],
         )
     )
+    cg.add(var.set_layout(getattr(ns.enum("Layout", True), config["layout"])))
     cg.add(var.set_usb_ids(config["usb_vendor_id"], config["usb_product_id"]))
     if "vbus_monitor_pin" in config:
         cg.add(var.set_vbus_monitor_pin(config["vbus_monitor_pin"]))
