@@ -3,6 +3,7 @@
 #include "keyboard_engine.h"
 #include "layouts.h"
 #include "mouse_engine.h"
+#include "pointer_engine.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
 #include "tinyusb.h"
@@ -28,8 +29,12 @@ class HIDKeyboard : public Component {
   void set_mouse(bool enabled, uint32_t click_ms, uint32_t gap_ms) {
     mouse_enabled_ = enabled;
     mouse_engine_.configure(click_ms, gap_ms);
-    mouse_active_.store(enabled);
   }
+  // Optional absolute pointer (third interface); VNC-style full-state events.
+  void set_pointer(bool enabled) { pointer_enabled_ = enabled; }
+  void pointer_event(int x, int y, int buttons, int wheel);
+  static uint8_t mouse_instance() { return rel_ch_.instance.load(); }
+  static uint8_t pointer_instance() { return abs_ch_.instance.load(); }
   void mouse_move(int dx, int dy, int wheel) {
     mouse_sync_();
     mouse_accept_(mouse_enabled_ ? mouse_engine_.move(dx, dy, wheel) : Result::UNAVAILABLE);
@@ -70,10 +75,11 @@ class HIDKeyboard : public Component {
     protocol_changed();
     sync_lifecycle_();
     engine_.cancel();
-    if (mouse_enabled_) {
+    if (mouse_enabled_ || pointer_enabled_) {
       mouse_sync_();
-      mouse_observed_epoch_ = mouse_epoch_.load();  // protocol_changed() above must not drop the release report.
-      mouse_engine_.cancel();
+      pointer_observed_epoch_ = pointer_epoch_.load();  // protocol_changed() above must not drop the release.
+      if (mouse_enabled_) mouse_engine_.cancel();
+      if (pointer_enabled_) pointer_engine_.cancel();
     }
   }
   bool is_connected() const;
@@ -91,9 +97,8 @@ class HIDKeyboard : public Component {
   static void set_idle(uint8_t rate);
   static void set_leds(uint8_t leds);
   static void usb_frame();
-  static void mouse_transfer_complete();
-  static void mouse_transfer_failed();
-  static void mouse_protocol_changed() { mouse_epoch_.fetch_add(1); }
+  static void channel_complete_(uint8_t instance, bool failed);
+  static void mouse_protocol_changed() { pointer_epoch_.fetch_add(1); }
   static void mouse_frame_();
   static Report snapshot();
 
@@ -103,9 +108,23 @@ class HIDKeyboard : public Component {
   void mouse_loop_();
   void mouse_accept_(Result result);
   void mouse_button_(Op op, StringRef button);
+  enum Mailbox : uint32_t { FREE, REQUESTED, IN_FLIGHT, COMPLETE, RETRY, FAILED };
+  // One mailbox per extra interface, serviced by the USB task like the keyboard's.
+  struct Channel {
+    std::atomic<uint32_t> mailbox{FREE}, word0{0}, word1{0}, request_epoch{0};
+    std::atomic<uint8_t> instance{0xff};  // TinyUSB HID instance, or 0xff when absent.
+  };
+  static void channel_frame_(Channel &channel, bool pointer);
+  bool channel_ready_(Channel &channel, bool &inflight, uint32_t &sent_at, uint32_t now, bool &failed);
+  void channel_send_(Channel &channel, bool &inflight, uint32_t &sent_at, uint32_t now, uint32_t word0,
+                     uint32_t word1);
+  void build_config_descriptor_();
   MouseEngine mouse_engine_;
-  bool mouse_enabled_{false}, mouse_inflight_{false};
-  uint32_t mouse_observed_epoch_{0}, mouse_sent_at_{0};
+  PointerEngine pointer_engine_;
+  bool mouse_enabled_{false}, mouse_inflight_{false}, pointer_enabled_{false}, pointer_inflight_{false};
+  uint32_t pointer_observed_epoch_{0}, mouse_sent_at_{0}, pointer_sent_at_{0};
+  uint8_t config_descriptor_[TUD_CONFIG_DESC_LEN + 3 * TUD_HID_DESC_LEN]{};
+  static Channel rel_ch_, abs_ch_;
   Result mouse_result_{Result::ACCEPTED};
   void sync_lifecycle_();
   void submit_key_(Operation operation, StringRef key, int modifiers) {
@@ -129,12 +148,11 @@ class HIDKeyboard : public Component {
   tusb_desc_device_t device_descriptor_{};
   // A single atomic mailbox keeps all TinyUSB report operations on its own
   // servicing task. The main loop publishes only when the slot is FREE.
-  enum Mailbox : uint32_t { FREE, REQUESTED, IN_FLIGHT, COMPLETE, RETRY, FAILED };
   static std::atomic<uint32_t> generation_, mailbox_, request_generation_, request_report_, request_report2_,
       snapshot_, snapshot2_, snapshot_generation_;
   static std::atomic<uint8_t> idle_rate_, leds_;
-  static std::atomic<bool> usb_available_, mouse_active_;
-  static std::atomic<uint32_t> mouse_mailbox_, mouse_report_, mouse_epoch_, mouse_request_epoch_;
+  static std::atomic<bool> usb_available_;
+  static std::atomic<uint32_t> pointer_epoch_;
   static uint32_t usb_last_report_at_;  // USB task only
 };
 

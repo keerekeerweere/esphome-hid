@@ -117,6 +117,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional("max_text_length", default=256): cv.int_range(min=1, max=1024),
             cv.Optional("queue_size", default=4): cv.int_range(min=1, max=8),
             cv.Optional("mouse", default=False): cv.boolean,
+            cv.Optional("absolute_pointer", default=False): cv.boolean,
             cv.Optional("mouse_click_duration", default="30ms"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(min=cv.TimePeriod(milliseconds=1), max=cv.TimePeriod(seconds=1)),
@@ -168,12 +169,13 @@ async def to_code(config):
             config["mouse_report_interval"].total_milliseconds,
         )
     )
+    cg.add(var.set_pointer(config["absolute_pointer"]))
     cg.add(var.set_usb_ids(config["usb_vendor_id"], config["usb_product_id"]))
     if "vbus_monitor_pin" in config:
         cg.add(var.set_vbus_monitor_pin(config["vbus_monitor_pin"]))
     esp32.add_idf_component(name="espressif/esp_tinyusb", ref="3.0.1")
     for name, value in {
-        "CONFIG_TINYUSB_HID_COUNT": 2 if config["mouse"] else 1,
+        "CONFIG_TINYUSB_HID_COUNT": 1 + int(config["mouse"]) + int(config["absolute_pointer"]),
         "CONFIG_TINYUSB_SUSPEND_CALLBACK": True,
         "CONFIG_TINYUSB_RESUME_CALLBACK": True,
     }.items():
@@ -240,6 +242,22 @@ automation.register_apply_action(
     ),
     automation.ApplyCall(
         "mouse_move({}, {}, {})", (("dx", cg.int_), ("dy", cg.int_), ("wheel", cg.int_))
+    ),
+)
+automation.register_apply_action(
+    "hid_keyboard.pointer_event",
+    cv.Schema(
+        {
+            **ID_SCHEMA,
+            cv.Required("x"): cv.templatable(cv.int_range(min=0, max=32767)),
+            cv.Required("y"): cv.templatable(cv.int_range(min=0, max=32767)),
+            cv.Optional("buttons", default=0): cv.templatable(cv.int_range(min=0, max=31)),
+            cv.Optional("wheel", default=0): cv.templatable(cv.int_range(min=-127, max=127)),
+        }
+    ),
+    automation.ApplyCall(
+        "pointer_event({}, {}, {}, {})",
+        (("x", cg.int_), ("y", cg.int_), ("buttons", cg.int_), ("wheel", cg.int_)),
     ),
 )
 for action in ("press", "release", "click"):

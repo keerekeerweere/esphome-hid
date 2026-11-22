@@ -19,9 +19,9 @@ std::atomic<uint32_t> HIDKeyboard::generation_{0}, HIDKeyboard::mailbox_{FREE}, 
 // Match the pinned TinyUSB driver's reset idle rate, so GET_IDLE and actual
 // retransmission behavior agree without modifying the class driver's internals.
 std::atomic<uint8_t> HIDKeyboard::idle_rate_{0}, HIDKeyboard::leds_{0};
-std::atomic<bool> HIDKeyboard::usb_available_{false}, HIDKeyboard::mouse_active_{false};
-std::atomic<uint32_t> HIDKeyboard::mouse_mailbox_{FREE}, HIDKeyboard::mouse_report_{0}, HIDKeyboard::mouse_epoch_{0},
-    HIDKeyboard::mouse_request_epoch_{0};
+std::atomic<bool> HIDKeyboard::usb_available_{false};
+std::atomic<uint32_t> HIDKeyboard::pointer_epoch_{0};
+HIDKeyboard::Channel HIDKeyboard::rel_ch_, HIDKeyboard::abs_ch_;
 uint32_t HIDKeyboard::usb_last_report_at_{0};
 
 void HIDKeyboard::setup() {
@@ -47,11 +47,8 @@ void HIDKeyboard::setup() {
   config.descriptor.device = &device_descriptor_;
   config.descriptor.string = strings_;
   config.descriptor.string_count = 4;
-  if (mouse_enabled_)
-    config.descriptor.full_speed_config =
-        vbus_pin_ >= 0 ? MOUSE_SELF_POWERED_CONFIG_DESCRIPTOR : MOUSE_CONFIG_DESCRIPTOR;
-  else
-    config.descriptor.full_speed_config = vbus_pin_ >= 0 ? SELF_POWERED_CONFIG_DESCRIPTOR : CONFIG_DESCRIPTOR;
+  build_config_descriptor_();
+  config.descriptor.full_speed_config = config_descriptor_;
   config.event_cb = [](tinyusb_event_t* event, void*) {
     if (event->id == TINYUSB_EVENT_ATTACHED) {
       protocol_changed();
@@ -132,8 +129,37 @@ bool HIDKeyboard::send_(const Report &report) {
   return true;
 }
 
+void HIDKeyboard::build_config_descriptor_() {
+  // Interface order is fixed: keyboard, then relative mouse, then absolute pointer.
+  const uint8_t interfaces = 1 + (mouse_enabled_ ? 1 : 0) + (pointer_enabled_ ? 1 : 0);
+  const uint16_t total = TUD_CONFIG_DESC_LEN + interfaces * TUD_HID_DESC_LEN;
+  const bool self_powered = vbus_pin_ >= 0;
+  uint8_t *out = config_descriptor_;
+  const uint8_t header[] = {TUD_CONFIG_DESCRIPTOR(1, interfaces, 0, total,
+                                                  self_powered ? TUSB_DESC_CONFIG_ATT_SELF_POWERED : 0,
+                                                  self_powered ? 2 : 100)};
+  std::memcpy(out, header, sizeof(header));
+  out += sizeof(header);
+  std::memcpy(out, KEYBOARD_ITF, sizeof(KEYBOARD_ITF));
+  out += sizeof(KEYBOARD_ITF);
+  uint8_t instance = 1;
+  rel_ch_.instance.store(0xff);
+  abs_ch_.instance.store(0xff);
+  if (mouse_enabled_) {
+    std::memcpy(out, MOUSE_ITF, sizeof(MOUSE_ITF));
+    out += sizeof(MOUSE_ITF);
+    rel_ch_.instance.store(instance++);
+  }
+  if (pointer_enabled_) {
+    const uint8_t *itf = mouse_enabled_ ? POINTER_ITF_2 : POINTER_ITF_1;
+    std::memcpy(out, itf, TUD_HID_DESC_LEN);
+    abs_ch_.instance.store(instance++);
+  }
+}
+
 void HIDKeyboard::mouse_sync_() {
   mouse_engine_.set_available(initialized_ && is_connected());
+  pointer_engine_.set_available(initialized_ && is_connected());
 }
 
 void HIDKeyboard::mouse_accept_(Result result) {
@@ -146,9 +172,9 @@ const char *HIDKeyboard::last_mouse_message() const {
     case Result::ACCEPTED:
       return "accepted";
     case Result::UNAVAILABLE:
-      return mouse_enabled_ ? "USB host unavailable" : "mouse is not enabled (set mouse: true)";
+      return mouse_enabled_ || pointer_enabled_ ? "USB host unavailable" : "mouse/pointer is not enabled";
     case Result::INVALID_INPUT:
-      return "unknown button or distance out of range";
+      return "unknown button or value out of range";
     case Result::QUEUE_FULL:
       return "mouse queue full";
     case Result::CANCELLED:
@@ -168,64 +194,111 @@ void HIDKeyboard::mouse_button_(Op op, StringRef name) {
                                     : mouse_engine_.click(mask));
 }
 
+void HIDKeyboard::pointer_event(int x, int y, int buttons, int wheel) {
+  mouse_sync_();
+  mouse_accept_(pointer_enabled_ ? pointer_engine_.event(x, y, buttons, wheel) : Result::UNAVAILABLE);
+}
+
+// Returns true when the channel's mailbox is free for a new report.
+bool HIDKeyboard::channel_ready_(Channel &channel, bool &inflight, uint32_t &sent_at, uint32_t now, bool &failed) {
+  failed = false;
+  if (inflight) {
+    const auto state = channel.mailbox.load();
+    if (state == COMPLETE || state == RETRY || state == FAILED) {
+      inflight = false;
+      channel.mailbox.store(FREE);
+      failed = state == FAILED;
+    } else if (static_cast<uint32_t>(now - sent_at) >= 2000) {
+      failed = true;  // Keep waiting for the endpoint; never overlap transfers.
+    }
+  }
+  return !inflight && channel.mailbox.load() == FREE;
+}
+
+void HIDKeyboard::channel_send_(Channel &channel, bool &inflight, uint32_t &sent_at, uint32_t now, uint32_t word0,
+                                uint32_t word1) {
+  channel.word0.store(word0);
+  channel.word1.store(word1);
+  channel.request_epoch.store(pointer_epoch_.load());
+  channel.mailbox.store(REQUESTED);
+  inflight = true;
+  sent_at = now;
+}
+
 void HIDKeyboard::mouse_loop_() {
   const uint32_t now = millis();
   mouse_sync_();
-  const auto epoch = mouse_epoch_.load();
-  if (epoch != mouse_observed_epoch_) {
-    mouse_observed_epoch_ = epoch;
+  const auto epoch = pointer_epoch_.load();
+  if (epoch != pointer_observed_epoch_) {
+    pointer_observed_epoch_ = epoch;
     mouse_engine_.reset();
+    pointer_engine_.reset();
   }
   if (!is_connected()) return;
-  if (mouse_inflight_) {
-    const auto state = mouse_mailbox_.load();
-    if (state == COMPLETE || state == RETRY || state == FAILED) {
-      mouse_inflight_ = false;
-      mouse_mailbox_.store(FREE);
-      if (state == FAILED) mouse_engine_.cancel();
-    } else if (static_cast<uint32_t>(now - mouse_sent_at_) >= 2000) {
-      mouse_engine_.cancel();  // Keep waiting for the endpoint; never overlap transfers.
-    }
-    if (mouse_inflight_) return;
+  bool failed = false;
+  if (mouse_enabled_ && channel_ready_(rel_ch_, mouse_inflight_, mouse_sent_at_, now, failed) && !failed) {
+    MouseReport report;
+    if (mouse_engine_.next_report(now, report))
+      channel_send_(rel_ch_, mouse_inflight_, mouse_sent_at_, now,
+                    static_cast<uint32_t>(report.buttons) | (static_cast<uint32_t>(static_cast<uint8_t>(report.dx)) << 8) |
+                        (static_cast<uint32_t>(static_cast<uint8_t>(report.dy)) << 16) |
+                        (static_cast<uint32_t>(static_cast<uint8_t>(report.wheel)) << 24),
+                    0);
   }
-  MouseReport report;
-  if (mouse_mailbox_.load() != FREE || !mouse_engine_.next_report(now, report)) return;
-  mouse_report_.store(static_cast<uint32_t>(report.buttons) | (static_cast<uint32_t>(static_cast<uint8_t>(report.dx)) << 8) |
-                      (static_cast<uint32_t>(static_cast<uint8_t>(report.dy)) << 16) |
-                      (static_cast<uint32_t>(static_cast<uint8_t>(report.wheel)) << 24));
-  mouse_request_epoch_.store(mouse_epoch_.load());
-  mouse_mailbox_.store(REQUESTED);
-  mouse_inflight_ = true;
-  mouse_sent_at_ = now;
+  if (failed) mouse_engine_.cancel();
+  failed = false;
+  if (pointer_enabled_ && channel_ready_(abs_ch_, pointer_inflight_, pointer_sent_at_, now, failed) && !failed) {
+    PointerReport report;
+    if (pointer_engine_.next_report(report))
+      channel_send_(abs_ch_, pointer_inflight_, pointer_sent_at_, now,
+                    static_cast<uint32_t>(report.buttons) | (static_cast<uint32_t>(static_cast<uint8_t>(report.wheel)) << 8),
+                    static_cast<uint32_t>(report.x) | (static_cast<uint32_t>(report.y) << 16));
+  }
+  if (failed) pointer_engine_.cancel();
+}
+
+// USB task: send a requested report on a channel (instance index from enumeration).
+void HIDKeyboard::channel_frame_(Channel &channel, bool pointer) {
+  const uint8_t instance = channel.instance.load();
+  if (instance == 0xff || !usb_available_.load()) return;
+  const auto state = channel.mailbox.load();
+  if (state != REQUESTED && state != IN_FLIGHT) return;
+  if (channel.request_epoch.load() != pointer_epoch_.load()) {
+    channel.mailbox.store(RETRY);
+    return;
+  }
+  if (state != REQUESTED || !tud_mounted() || tud_suspended() || !tud_hid_n_ready(instance)) return;
+  const auto w0 = channel.word0.load(), w1 = channel.word1.load();
+  bool sent;
+  if (pointer) {
+    // buttons, X (LE16), Y (LE16), wheel
+    const uint8_t report[6]{static_cast<uint8_t>(w0),      static_cast<uint8_t>(w1),       static_cast<uint8_t>(w1 >> 8),
+                            static_cast<uint8_t>(w1 >> 16), static_cast<uint8_t>(w1 >> 24), static_cast<uint8_t>(w0 >> 8)};
+    sent = tud_hid_n_report(instance, 0, report, sizeof(report));
+  } else {
+    sent = tud_hid_n_mouse_report(instance, 0, w0 & 0xff, static_cast<int8_t>(w0 >> 8), static_cast<int8_t>(w0 >> 16),
+                                  static_cast<int8_t>(w0 >> 24), 0);
+  }
+  if (sent) channel.mailbox.store(IN_FLIGHT);
 }
 
 void HIDKeyboard::mouse_frame_() {
-  if (!mouse_active_.load() || !usb_available_.load()) return;
-  const auto state = mouse_mailbox_.load();
-  if (state != REQUESTED && state != IN_FLIGHT) return;
-  if (mouse_request_epoch_.load() != mouse_epoch_.load()) {
-    mouse_mailbox_.store(RETRY);
-    return;
-  }
-  if (state != REQUESTED || !tud_mounted() || tud_suspended() || !tud_hid_n_ready(1)) return;
-  const auto packed = mouse_report_.load();
-  if (tud_hid_n_mouse_report(1, 0, packed & 0xff, static_cast<int8_t>(packed >> 8), static_cast<int8_t>(packed >> 16),
-                             static_cast<int8_t>(packed >> 24), 0))
-    mouse_mailbox_.store(IN_FLIGHT);
+  channel_frame_(rel_ch_, false);
+  channel_frame_(abs_ch_, true);
 }
 
-void HIDKeyboard::mouse_transfer_complete() {
-  if (mouse_mailbox_.load() == IN_FLIGHT)
-    mouse_mailbox_.store(mouse_request_epoch_.load() == mouse_epoch_.load() ? COMPLETE : RETRY);
-}
-
-void HIDKeyboard::mouse_transfer_failed() {
-  if (mouse_mailbox_.load() == IN_FLIGHT) mouse_mailbox_.store(FAILED);
+void HIDKeyboard::channel_complete_(uint8_t instance, bool failed) {
+  Channel &channel = instance == rel_ch_.instance.load() ? rel_ch_ : abs_ch_;
+  if (channel.mailbox.load() != IN_FLIGHT) return;
+  if (failed)
+    channel.mailbox.store(FAILED);
+  else
+    channel.mailbox.store(channel.request_epoch.load() == pointer_epoch_.load() ? COMPLETE : RETRY);
 }
 
 void HIDKeyboard::loop() {
   if (!initialized_) return;
-  if (mouse_enabled_) mouse_loop_();
+  if (mouse_enabled_ || pointer_enabled_) mouse_loop_();
   sync_lifecycle_();
   const uint32_t now = millis();
   if (!is_connected()) return;
@@ -257,7 +330,8 @@ void HIDKeyboard::loop() {
 
 void HIDKeyboard::dump_config() {
   ESP_LOGCONFIG(TAG, "USB Boot Keyboard: layout %s; ID-free boot interface", layout_name());
-  ESP_LOGCONFIG(TAG, "  Mouse: %s", mouse_enabled_ ? "relative boot mouse (second interface)" : "disabled");
+  ESP_LOGCONFIG(TAG, "  Relative mouse: %s", mouse_enabled_ ? "boot mouse interface" : "disabled");
+  ESP_LOGCONFIG(TAG, "  Absolute pointer: %s", pointer_enabled_ ? "enabled (0..32767)" : "disabled");
   if (vbus_pin_ < 0)
     ESP_LOGCONFIG(TAG, "  Bus-powered mode (no VBUS sense)");
   else
@@ -268,7 +342,7 @@ void HIDKeyboard::bus_event(uint32_t event) {
   if (event == DCD_EVENT_BUS_RESET || event == DCD_EVENT_UNPLUGGED || event == DCD_EVENT_SUSPEND) {
     usb_available_.store(false);
     generation_.fetch_add(1, std::memory_order_relaxed);
-    mouse_epoch_.fetch_add(1, std::memory_order_relaxed);
+    pointer_epoch_.fetch_add(1, std::memory_order_relaxed);
     if (event == DCD_EVENT_BUS_RESET) {
       idle_rate_.store(0);
       leds_.store(0);
@@ -277,7 +351,7 @@ void HIDKeyboard::bus_event(uint32_t event) {
 }
 void HIDKeyboard::protocol_changed() {
   generation_.fetch_add(1);
-  mouse_epoch_.fetch_add(1);
+  pointer_epoch_.fetch_add(1);
 }
 void HIDKeyboard::transfer_complete() {
   usb_last_report_at_ = millis();
@@ -366,13 +440,16 @@ void tud_sof_cb(uint32_t) {
   esphome::hid_keyboard::HIDKeyboard::usb_frame();
 }
 const uint8_t* tud_hid_descriptor_report_cb(uint8_t instance) {
-  return instance == 1 ? esphome::hid_keyboard::MOUSE_REPORT_DESCRIPTOR : esphome::hid_keyboard::REPORT_DESCRIPTOR;
+  using esphome::hid_keyboard::HIDKeyboard;
+  if (instance != 0 && instance == HIDKeyboard::pointer_instance()) return esphome::hid_keyboard::POINTER_REPORT_DESCRIPTOR;
+  if (instance != 0 && instance == HIDKeyboard::mouse_instance()) return esphome::hid_keyboard::MOUSE_REPORT_DESCRIPTOR;
+  return esphome::hid_keyboard::REPORT_DESCRIPTOR;
 }
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type, uint8_t* buffer,
                                uint16_t length) {
-  if (instance == 1) {  // Mouse: report the idle (all zero) state.
+  if (instance != 0) {  // Mouse / pointer: report the idle (all zero) state.
     if (type != HID_REPORT_TYPE_INPUT) return 0;
-    const auto size = std::min<uint16_t>(length, 5);
+    const auto size = std::min<uint16_t>(length, esphome::hid_keyboard::HIDKeyboard::pointer_instance() == instance ? 6 : 5);
     std::memset(buffer, 0, size);
     return size;
   }
@@ -393,7 +470,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 }
 void tud_hid_set_protocol_cb(uint8_t instance, uint8_t) {
   // The mouse interface switching protocol must not disturb the keyboard.
-  if (instance == 1)
+  if (instance != 0)
     esphome::hid_keyboard::HIDKeyboard::mouse_protocol_changed();
   else
     esphome::hid_keyboard::HIDKeyboard::protocol_changed();
@@ -403,14 +480,14 @@ bool tud_hid_set_idle_cb(uint8_t instance, uint8_t rate) {
   return true;
 }
 void tud_hid_report_complete_cb(uint8_t instance, const uint8_t*, uint16_t) {
-  if (instance == 1)
-    esphome::hid_keyboard::HIDKeyboard::mouse_transfer_complete();
+  if (instance != 0)
+    esphome::hid_keyboard::HIDKeyboard::channel_complete_(instance, false);
   else
     esphome::hid_keyboard::HIDKeyboard::transfer_complete();
 }
 void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t, const uint8_t*, uint16_t) {
-  if (instance == 1)
-    esphome::hid_keyboard::HIDKeyboard::mouse_transfer_failed();
+  if (instance != 0)
+    esphome::hid_keyboard::HIDKeyboard::channel_complete_(instance, true);
   else
     esphome::hid_keyboard::HIDKeyboard::transfer_failed();
 }

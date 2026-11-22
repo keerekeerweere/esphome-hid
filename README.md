@@ -192,3 +192,15 @@ independent of `layout`, which suits remote-control apps that read physical
 key codes. Press/release pairs are queued so a quick tap is never lost, and a
 queued `tap`/`type` or `release_all` drops the live state. Live events are
 rejected while a queued tap or text is running.
+
+## Absolute pointer (local addition)
+
+`absolute_pointer: true` adds a third USB interface (not a boot device): 5 buttons,
+16-bit X/Y over 0..32767 and a wheel. `hid_keyboard.pointer_event` (`x`, `y`,
+`buttons`, `wheel`) carries the full pointer state like a VNC PointerEvent, so a
+click on a remote-control video lands on the same spot of the target screen.
+Buttons are a bitmask (1 left, 2 right, 4 middle, 8 back, 16 forward), wheel is
+one-shot notches (+ up). Pending pure moves coalesce to the latest position;
+button changes and wheel events are never dropped. It works once the OS loads a
+driver; BIOS/UEFI should keep using the relative boot mouse (`mouse: true`).
+Enable both: the OS sees two pointing devices, which is normal for such KVMs.
