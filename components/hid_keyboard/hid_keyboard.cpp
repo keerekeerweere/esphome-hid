@@ -89,7 +89,11 @@ void HIDKeyboard::sync_lifecycle_() {
 
 void HIDKeyboard::accept_(Result result) {
   last_was_mouse_ = false;
-  if (result != Result::ACCEPTED) ESP_LOGW(TAG, "Keyboard request rejected: %s", last_result_message());
+  // An unplugged or rebooting host makes every request fail; that is expected, not a warning.
+  if (result == Result::UNAVAILABLE)
+    ESP_LOGD(TAG, "Keyboard request ignored: %s", last_result_message());
+  else if (result != Result::ACCEPTED)
+    ESP_LOGW(TAG, "Keyboard request rejected: %s", last_result_message());
 }
 
 const char* HIDKeyboard::last_result_message() const {
@@ -176,7 +180,10 @@ void HIDKeyboard::mouse_sync_() {
 void HIDKeyboard::mouse_accept_(Result result) {
   last_was_mouse_ = true;
   mouse_result_ = result;
-  if (result != Result::ACCEPTED) ESP_LOGW(TAG, "Mouse request rejected: %s", last_mouse_message());
+  if (result == Result::UNAVAILABLE)
+    ESP_LOGD(TAG, "Mouse request ignored: %s", last_mouse_message());
+  else if (result != Result::ACCEPTED)
+    ESP_LOGW(TAG, "Mouse request rejected: %s", last_mouse_message());
 }
 
 const char *HIDKeyboard::last_mouse_message() const {
