@@ -55,6 +55,17 @@ class HIDKeyboard : public Component {
     sync_lifecycle_();
     accept_(engine_.submit_text({text.c_str(), text.size()}));
   }
+  // Live key state for remote control: usage is a USB HID usage code
+  // (0x04-0xA4 keys, 0xE0-0xE7 modifiers). Independent of the text layout.
+  void key_event(int usage, bool down) {
+    sync_lifecycle_();
+    if (usage < 0 || usage > 255) {
+      engine_.reject_input();
+      accept_(Result::INVALID_INPUT);
+      return;
+    }
+    accept_(engine_.key_event(static_cast<uint8_t>(usage), down));
+  }
   void release_all() {
     protocol_changed();
     sync_lifecycle_();
@@ -119,8 +130,8 @@ class HIDKeyboard : public Component {
   // A single atomic mailbox keeps all TinyUSB report operations on its own
   // servicing task. The main loop publishes only when the slot is FREE.
   enum Mailbox : uint32_t { FREE, REQUESTED, IN_FLIGHT, COMPLETE, RETRY, FAILED };
-  static std::atomic<uint32_t> generation_, mailbox_, request_generation_, request_report_, snapshot_,
-      snapshot_generation_;
+  static std::atomic<uint32_t> generation_, mailbox_, request_generation_, request_report_, request_report2_,
+      snapshot_, snapshot2_, snapshot_generation_;
   static std::atomic<uint8_t> idle_rate_, leds_;
   static std::atomic<bool> usb_available_, mouse_active_;
   static std::atomic<uint32_t> mouse_mailbox_, mouse_report_, mouse_epoch_, mouse_request_epoch_;

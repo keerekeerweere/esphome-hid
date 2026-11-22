@@ -46,6 +46,10 @@ class KeyboardEngine {
   }
   Result submit_key(Operation operation, std::string_view name, uint8_t modifiers);
   Result submit_text(std::string_view text);
+  // Live key state for remote control (local addition): press/release one USB HID
+  // usage (0x04-0xA4 keys, 0xE0-0xE7 modifiers) without queueing; up to six keys
+  // are held at once. Rejected while a queued tap/text is running.
+  Result key_event(uint8_t usage, bool down);
   void cancel(Result reason = Result::CANCELLED);
   void set_available(bool available);
   void set_caps_lock(bool enabled) { caps_lock_ = enabled; }
@@ -84,6 +88,17 @@ class KeyboardEngine {
   Report current_{}, proposed_{};
   bool available_{false}, neutral_pending_{true}, waiting_{false}, cancelled_inflight_{false}, caps_lock_{false};
   Result last_result_{Result::ACCEPTED};
+  // Live key states awaiting transmission, oldest first, so a quick press+release
+  // is not collapsed into nothing while a transfer is in flight.
+  static constexpr size_t LIVE_QUEUE = 16;
+  void live_push_();
+  void live_clear_() {
+    live_ = {};
+    live_count_ = 0;
+  }
+  Report live_{};
+  std::array<Report, LIVE_QUEUE> live_queue_{};
+  size_t live_head_{0}, live_count_{0};
   Layout layout_{static_cast<Layout>(0)};  // QWERTY_US
 };
 

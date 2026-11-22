@@ -14,7 +14,8 @@ static const char* const TAG = "hid_keyboard";
 // PSRAM workaround. The toolchain's is_always_lock_free flag is false with
 // that workaround, so do not override SDK atomics or compiler feature macros.
 std::atomic<uint32_t> HIDKeyboard::generation_{0}, HIDKeyboard::mailbox_{FREE}, HIDKeyboard::request_generation_{0},
-    HIDKeyboard::request_report_{0}, HIDKeyboard::snapshot_{0}, HIDKeyboard::snapshot_generation_{0};
+    HIDKeyboard::request_report_{0}, HIDKeyboard::request_report2_{0}, HIDKeyboard::snapshot_{0},
+    HIDKeyboard::snapshot2_{0}, HIDKeyboard::snapshot_generation_{0};
 // Match the pinned TinyUSB driver's reset idle rate, so GET_IDLE and actual
 // retransmission behavior agree without modifying the class driver's internals.
 std::atomic<uint8_t> HIDKeyboard::idle_rate_{0}, HIDKeyboard::leds_{0};
@@ -83,6 +84,7 @@ void HIDKeyboard::sync_lifecycle_() {
     engine_.reset();
     engine_transfer_ = false;
     snapshot_.store(0);
+    snapshot2_.store(0);
   }
   engine_.set_available(is_connected());
   engine_.set_caps_lock((leds_.load() & 2) != 0);
@@ -117,7 +119,11 @@ bool HIDKeyboard::send_(const Report &report) {
   const auto generation = generation_.load();
   if (generation != observed_generation_) return false;
   request_generation_.store(generation);
-  request_report_.store(report.modifiers | (static_cast<uint32_t>(report.keys[0]) << 8));
+  // Six keys do not fit one 32-bit atomic; mailbox_.store(REQUESTED) below publishes both words.
+  request_report_.store(report.modifiers | (static_cast<uint32_t>(report.keys[0]) << 8) |
+                        (static_cast<uint32_t>(report.keys[1]) << 16) | (static_cast<uint32_t>(report.keys[2]) << 24));
+  request_report2_.store(report.keys[3] | (static_cast<uint32_t>(report.keys[4]) << 8) |
+                         (static_cast<uint32_t>(report.keys[5]) << 16));
   mailbox_.store(REQUESTED);
   inflight_ = true;
   engine_transfer_ = true;
@@ -302,10 +308,13 @@ void HIDKeyboard::usb_frame() {
     return;
   }
   if (state != REQUESTED || !tud_mounted() || tud_suspended() || !tud_hid_ready()) return;
-  const auto packed = request_report_.load();
-  const uint8_t keys[6]{static_cast<uint8_t>(packed >> 8), 0, 0, 0, 0, 0};
+  const auto packed = request_report_.load(), packed2 = request_report2_.load();
+  const uint8_t keys[6]{static_cast<uint8_t>(packed >> 8),  static_cast<uint8_t>(packed >> 16),
+                        static_cast<uint8_t>(packed >> 24), static_cast<uint8_t>(packed2),
+                        static_cast<uint8_t>(packed2 >> 8), static_cast<uint8_t>(packed2 >> 16)};
   if (tud_hid_keyboard_report(0, packed & 0xff, keys)) {
     snapshot_.store(packed);
+    snapshot2_.store(packed2);
     snapshot_generation_.store(request_generation_.load());
     usb_last_report_at_ = millis();
     mailbox_.store(IN_FLIGHT);
@@ -323,7 +332,10 @@ Report HIDKeyboard::snapshot() {
   if (!usb_available_.load() || snapshot_generation_.load() != generation_.load()) return report;
   const uint32_t packed = snapshot_.load();
   report.modifiers = packed & 0xff;
-  report.keys[0] = (packed >> 8) & 0xff;
+  const uint32_t packed2 = snapshot2_.load();
+  report.keys = {static_cast<uint8_t>(packed >> 8),  static_cast<uint8_t>(packed >> 16),
+                 static_cast<uint8_t>(packed >> 24), static_cast<uint8_t>(packed2),
+                 static_cast<uint8_t>(packed2 >> 8), static_cast<uint8_t>(packed2 >> 16)};
   return report;
 }
 }  // namespace esphome::hid_keyboard

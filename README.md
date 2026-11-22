@@ -182,3 +182,13 @@ Actions: `hid_keyboard.mouse_move` (`dx`, `dy`, `wheel`; +x right, +y down,
 mouse buttons. `hid_keyboard.last_mouse_accepted` and `last_mouse_message()`
 report the result. Movement is relative only: the host applies its pointer
 acceleration, so distances are not pixel-exact.
+
+## Live key events (local addition)
+
+`hid_keyboard.key_event` (`usage`, `down`) presses or releases one key by USB HID
+usage code (`0x04`-`0xA4` keys, `0xE0`-`0xE7` modifiers) and sends the report
+immediately, with up to six keys held (the seventh is rejected). It is
+independent of `layout`, which suits remote-control apps that read physical
+key codes. Press/release pairs are queued so a quick tap is never lost, and a
+queued `tap`/`type` or `release_all` drops the live state. Live events are
+rejected while a queued tap or text is running.

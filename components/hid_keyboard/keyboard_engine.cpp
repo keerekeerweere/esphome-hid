@@ -112,6 +112,7 @@ Result KeyboardEngine::submit_key(Operation operation, std::string_view name, ui
     return result_(Result::INVALID_INPUT);
   }
   if (!room_()) return result_(Result::QUEUE_FULL);
+  live_clear_();  // The baseline report releases any live keys.
   auto &request = back_();
   request.operation = operation;
   request.key = {key.code, static_cast<uint8_t>(key.modifiers | modifiers), key.letter};
@@ -137,11 +138,50 @@ Result KeyboardEngine::submit_text(std::string_view text) {
   if (keys.empty()) return result_(Result::ACCEPTED);
   if (keys.size() > max_length_ * 2) return result_(Result::TOO_LONG);
   if (!room_()) return result_(Result::QUEUE_FULL);
+  live_clear_();
   auto &request = back_();
   request.operation = Operation::TEXT;
   request.keys = std::move(keys);
   count_++;
   return result_(Result::ACCEPTED);
+}
+
+Result KeyboardEngine::key_event(uint8_t usage, bool down) {
+  if (!available_) return result_(Result::UNAVAILABLE);
+  if (count_ != 0 || stage_ != Stage::IDLE || neutral_pending_) return result_(Result::QUEUE_FULL);
+  if (usage >= 0xe0 && usage <= 0xe7) {
+    const uint8_t bit = static_cast<uint8_t>(1U << (usage - 0xe0));
+    live_.modifiers = down ? (live_.modifiers | bit) : (live_.modifiers & ~bit);
+  } else if (usage >= 0x04 && usage <= 0xa4) {
+    size_t slot = live_.keys.size();
+    size_t empty = live_.keys.size();
+    for (size_t i = 0; i < live_.keys.size(); i++) {
+      if (live_.keys[i] == usage) slot = i;
+      if (live_.keys[i] == 0 && empty == live_.keys.size()) empty = i;
+    }
+    if (down) {
+      if (slot == live_.keys.size()) {
+        if (empty == live_.keys.size()) return result_(Result::QUEUE_FULL);  // Seven keys: rollover exceeded.
+        live_.keys[empty] = usage;
+      }
+    } else if (slot != live_.keys.size()) {
+      live_.keys[slot] = 0;
+    }
+  } else {
+    return result_(Result::INVALID_INPUT);
+  }
+  live_push_();
+  return result_(Result::ACCEPTED);
+}
+
+void KeyboardEngine::live_push_() {
+  if (live_count_ == LIVE_QUEUE) {
+    // Full: fold into the newest pending state rather than dropping the event.
+    live_queue_[(live_head_ + live_count_ - 1) % LIVE_QUEUE] = live_;
+    return;
+  }
+  live_queue_[(live_head_ + live_count_) % LIVE_QUEUE] = live_;
+  live_count_++;
 }
 
 void KeyboardEngine::pop_() {
@@ -159,6 +199,7 @@ void KeyboardEngine::cancel(Result reason) {
   // Leave an in-flight transfer alone; release must follow its completion.
   stage_ = Stage::IDLE;
   neutral_pending_ = true;
+  live_clear_();
   cancelled_inflight_ = waiting_;
   result_(reason);
 }
@@ -210,6 +251,10 @@ bool KeyboardEngine::next_report(uint32_t now, Report &report) {
     proposed_ = {};
     proposed_.modifiers = key.modifiers;
     proposed_.keys[0] = key.code;
+  } else if (stage_ == Stage::IDLE && live_count_) {
+    proposed_ = live_queue_[live_head_];
+    live_head_ = (live_head_ + 1) % LIVE_QUEUE;
+    live_count_--;
   } else
     return false;
   report = proposed_;

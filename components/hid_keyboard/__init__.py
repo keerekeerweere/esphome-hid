@@ -195,6 +195,17 @@ for action in ("press", "tap"):
             f"{action}(StringRef({{}}), {{}})", (("key", cg.std_string), ("modifiers", cg.int_))
         ),
     )
+automation.register_apply_action(
+    "hid_keyboard.key_event",
+    cv.Schema(
+        {
+            **ID_SCHEMA,
+            cv.Required("usage"): cv.templatable(cv.int_range(min=0x04, max=0xE7)),
+            cv.Required("down"): cv.templatable(cv.boolean),
+        }
+    ),
+    automation.ApplyCall("key_event({}, {})", (("usage", cg.int_), ("down", cg.bool_))),
+)
 for action in ("release", "release_all"):
     automation.register_apply_action(
         f"hid_keyboard.{action}",
