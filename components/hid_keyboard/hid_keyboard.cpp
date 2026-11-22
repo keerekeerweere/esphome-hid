@@ -18,7 +18,9 @@ std::atomic<uint32_t> HIDKeyboard::generation_{0}, HIDKeyboard::mailbox_{FREE}, 
 // Match the pinned TinyUSB driver's reset idle rate, so GET_IDLE and actual
 // retransmission behavior agree without modifying the class driver's internals.
 std::atomic<uint8_t> HIDKeyboard::idle_rate_{0}, HIDKeyboard::leds_{0};
-std::atomic<bool> HIDKeyboard::usb_available_{false};
+std::atomic<bool> HIDKeyboard::usb_available_{false}, HIDKeyboard::mouse_active_{false};
+std::atomic<uint32_t> HIDKeyboard::mouse_mailbox_{FREE}, HIDKeyboard::mouse_report_{0}, HIDKeyboard::mouse_epoch_{0},
+    HIDKeyboard::mouse_request_epoch_{0};
 uint32_t HIDKeyboard::usb_last_report_at_{0};
 
 void HIDKeyboard::setup() {
@@ -44,7 +46,11 @@ void HIDKeyboard::setup() {
   config.descriptor.device = &device_descriptor_;
   config.descriptor.string = strings_;
   config.descriptor.string_count = 4;
-  config.descriptor.full_speed_config = vbus_pin_ >= 0 ? SELF_POWERED_CONFIG_DESCRIPTOR : CONFIG_DESCRIPTOR;
+  if (mouse_enabled_)
+    config.descriptor.full_speed_config =
+        vbus_pin_ >= 0 ? MOUSE_SELF_POWERED_CONFIG_DESCRIPTOR : MOUSE_CONFIG_DESCRIPTOR;
+  else
+    config.descriptor.full_speed_config = vbus_pin_ >= 0 ? SELF_POWERED_CONFIG_DESCRIPTOR : CONFIG_DESCRIPTOR;
   config.event_cb = [](tinyusb_event_t* event, void*) {
     if (event->id == TINYUSB_EVENT_ATTACHED) {
       protocol_changed();
@@ -120,8 +126,100 @@ bool HIDKeyboard::send_(const Report &report) {
   return true;
 }
 
+void HIDKeyboard::mouse_sync_() {
+  mouse_engine_.set_available(initialized_ && is_connected());
+}
+
+void HIDKeyboard::mouse_accept_(Result result) {
+  mouse_result_ = result;
+  if (result != Result::ACCEPTED) ESP_LOGW(TAG, "Mouse request rejected: %s", last_mouse_message());
+}
+
+const char *HIDKeyboard::last_mouse_message() const {
+  switch (mouse_result_) {
+    case Result::ACCEPTED:
+      return "accepted";
+    case Result::UNAVAILABLE:
+      return mouse_enabled_ ? "USB host unavailable" : "mouse is not enabled (set mouse: true)";
+    case Result::INVALID_INPUT:
+      return "unknown button or distance out of range";
+    case Result::QUEUE_FULL:
+      return "mouse queue full";
+    case Result::CANCELLED:
+      return "cancelled";
+    default:
+      return "USB transfer failed";
+  }
+}
+
+void HIDKeyboard::mouse_button_(Op op, StringRef name) {
+  mouse_sync_();
+  uint8_t mask = 0;
+  if (!mouse_enabled_) return mouse_accept_(Result::UNAVAILABLE);
+  if (!mouse_button({name.c_str(), name.size()}, mask)) return mouse_accept_(Result::INVALID_INPUT);
+  mouse_accept_(op == Op::PRESS     ? mouse_engine_.press(mask)
+                : op == Op::RELEASE ? mouse_engine_.release(mask)
+                                    : mouse_engine_.click(mask));
+}
+
+void HIDKeyboard::mouse_loop_() {
+  const uint32_t now = millis();
+  mouse_sync_();
+  const auto epoch = mouse_epoch_.load();
+  if (epoch != mouse_observed_epoch_) {
+    mouse_observed_epoch_ = epoch;
+    mouse_engine_.reset();
+  }
+  if (!is_connected()) return;
+  if (mouse_inflight_) {
+    const auto state = mouse_mailbox_.load();
+    if (state == COMPLETE || state == RETRY || state == FAILED) {
+      mouse_inflight_ = false;
+      mouse_mailbox_.store(FREE);
+      if (state == FAILED) mouse_engine_.cancel();
+    } else if (static_cast<uint32_t>(now - mouse_sent_at_) >= 2000) {
+      mouse_engine_.cancel();  // Keep waiting for the endpoint; never overlap transfers.
+    }
+    if (mouse_inflight_) return;
+  }
+  MouseReport report;
+  if (mouse_mailbox_.load() != FREE || !mouse_engine_.next_report(now, report)) return;
+  mouse_report_.store(static_cast<uint32_t>(report.buttons) | (static_cast<uint32_t>(static_cast<uint8_t>(report.dx)) << 8) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(report.dy)) << 16) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(report.wheel)) << 24));
+  mouse_request_epoch_.store(mouse_epoch_.load());
+  mouse_mailbox_.store(REQUESTED);
+  mouse_inflight_ = true;
+  mouse_sent_at_ = now;
+}
+
+void HIDKeyboard::mouse_frame_() {
+  if (!mouse_active_.load() || !usb_available_.load()) return;
+  const auto state = mouse_mailbox_.load();
+  if (state != REQUESTED && state != IN_FLIGHT) return;
+  if (mouse_request_epoch_.load() != mouse_epoch_.load()) {
+    mouse_mailbox_.store(RETRY);
+    return;
+  }
+  if (state != REQUESTED || !tud_mounted() || tud_suspended() || !tud_hid_n_ready(1)) return;
+  const auto packed = mouse_report_.load();
+  if (tud_hid_n_mouse_report(1, 0, packed & 0xff, static_cast<int8_t>(packed >> 8), static_cast<int8_t>(packed >> 16),
+                             static_cast<int8_t>(packed >> 24), 0))
+    mouse_mailbox_.store(IN_FLIGHT);
+}
+
+void HIDKeyboard::mouse_transfer_complete() {
+  if (mouse_mailbox_.load() == IN_FLIGHT)
+    mouse_mailbox_.store(mouse_request_epoch_.load() == mouse_epoch_.load() ? COMPLETE : RETRY);
+}
+
+void HIDKeyboard::mouse_transfer_failed() {
+  if (mouse_mailbox_.load() == IN_FLIGHT) mouse_mailbox_.store(FAILED);
+}
+
 void HIDKeyboard::loop() {
   if (!initialized_) return;
+  if (mouse_enabled_) mouse_loop_();
   sync_lifecycle_();
   const uint32_t now = millis();
   if (!is_connected()) return;
@@ -152,7 +250,8 @@ void HIDKeyboard::loop() {
 }
 
 void HIDKeyboard::dump_config() {
-  ESP_LOGCONFIG(TAG, "USB Boot Keyboard: US QWERTY; one ID-free boot interface");
+  ESP_LOGCONFIG(TAG, "USB Boot Keyboard: layout %s; ID-free boot interface", layout_name());
+  ESP_LOGCONFIG(TAG, "  Mouse: %s", mouse_enabled_ ? "relative boot mouse (second interface)" : "disabled");
   if (vbus_pin_ < 0)
     ESP_LOGCONFIG(TAG, "  Bus-powered mode (no VBUS sense)");
   else
@@ -163,6 +262,7 @@ void HIDKeyboard::bus_event(uint32_t event) {
   if (event == DCD_EVENT_BUS_RESET || event == DCD_EVENT_UNPLUGGED || event == DCD_EVENT_SUSPEND) {
     usb_available_.store(false);
     generation_.fetch_add(1, std::memory_order_relaxed);
+    mouse_epoch_.fetch_add(1, std::memory_order_relaxed);
     if (event == DCD_EVENT_BUS_RESET) {
       idle_rate_.store(0);
       leds_.store(0);
@@ -171,6 +271,7 @@ void HIDKeyboard::bus_event(uint32_t event) {
 }
 void HIDKeyboard::protocol_changed() {
   generation_.fetch_add(1);
+  mouse_epoch_.fetch_add(1);
 }
 void HIDKeyboard::transfer_complete() {
   usb_last_report_at_ = millis();
@@ -180,6 +281,7 @@ void HIDKeyboard::transfer_failed() {
   if (mailbox_.load() == IN_FLIGHT) mailbox_.store(FAILED);
 }
 void HIDKeyboard::usb_frame() {
+  mouse_frame_();
   // TinyUSB calls this from its task, not the SOF ISR. Serializing sends with
   // reset processing prevents a stale main-loop report entering a new session.
   if (!usb_available_.load()) return;
@@ -251,10 +353,17 @@ void tud_event_hook_cb(uint8_t, uint32_t event, bool) {
 void tud_sof_cb(uint32_t) {
   esphome::hid_keyboard::HIDKeyboard::usb_frame();
 }
-const uint8_t* tud_hid_descriptor_report_cb(uint8_t) {
-  return esphome::hid_keyboard::REPORT_DESCRIPTOR;
+const uint8_t* tud_hid_descriptor_report_cb(uint8_t instance) {
+  return instance == 1 ? esphome::hid_keyboard::MOUSE_REPORT_DESCRIPTOR : esphome::hid_keyboard::REPORT_DESCRIPTOR;
 }
-uint16_t tud_hid_get_report_cb(uint8_t, uint8_t report_id, hid_report_type_t type, uint8_t* buffer, uint16_t length) {
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type, uint8_t* buffer,
+                               uint16_t length) {
+  if (instance == 1) {  // Mouse: report the idle (all zero) state.
+    if (type != HID_REPORT_TYPE_INPUT) return 0;
+    const auto size = std::min<uint16_t>(length, 5);
+    std::memset(buffer, 0, size);
+    return size;
+  }
   if (report_id != 0) return 0;
   if (type == HID_REPORT_TYPE_OUTPUT && length > 0) {
     buffer[0] = esphome::hid_keyboard::HIDKeyboard::leds();
@@ -266,21 +375,31 @@ uint16_t tud_hid_get_report_cb(uint8_t, uint8_t report_id, hid_report_type_t typ
   std::memcpy(buffer, &report, size);
   return size;
 }
-void tud_hid_set_report_cb(uint8_t, uint8_t report_id, hid_report_type_t type, const uint8_t* buffer, uint16_t length) {
-  if (report_id == 0 && type == HID_REPORT_TYPE_OUTPUT && length == 1)
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type, const uint8_t* buffer, uint16_t length) {
+  if (instance == 0 && report_id == 0 && type == HID_REPORT_TYPE_OUTPUT && length == 1)
     esphome::hid_keyboard::HIDKeyboard::set_leds(buffer[0]);
 }
-void tud_hid_set_protocol_cb(uint8_t, uint8_t) {
-  esphome::hid_keyboard::HIDKeyboard::protocol_changed();
+void tud_hid_set_protocol_cb(uint8_t instance, uint8_t) {
+  // The mouse interface switching protocol must not disturb the keyboard.
+  if (instance == 1)
+    esphome::hid_keyboard::HIDKeyboard::mouse_protocol_changed();
+  else
+    esphome::hid_keyboard::HIDKeyboard::protocol_changed();
 }
-bool tud_hid_set_idle_cb(uint8_t, uint8_t rate) {
-  esphome::hid_keyboard::HIDKeyboard::set_idle(rate);
+bool tud_hid_set_idle_cb(uint8_t instance, uint8_t rate) {
+  if (instance == 0) esphome::hid_keyboard::HIDKeyboard::set_idle(rate);
   return true;
 }
-void tud_hid_report_complete_cb(uint8_t, const uint8_t*, uint16_t) {
-  esphome::hid_keyboard::HIDKeyboard::transfer_complete();
+void tud_hid_report_complete_cb(uint8_t instance, const uint8_t*, uint16_t) {
+  if (instance == 1)
+    esphome::hid_keyboard::HIDKeyboard::mouse_transfer_complete();
+  else
+    esphome::hid_keyboard::HIDKeyboard::transfer_complete();
 }
-void tud_hid_report_failed_cb(uint8_t, hid_report_type_t, const uint8_t*, uint16_t) {
-  esphome::hid_keyboard::HIDKeyboard::transfer_failed();
+void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t, const uint8_t*, uint16_t) {
+  if (instance == 1)
+    esphome::hid_keyboard::HIDKeyboard::mouse_transfer_failed();
+  else
+    esphome::hid_keyboard::HIDKeyboard::transfer_failed();
 }
 }

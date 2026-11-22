@@ -116,6 +116,15 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional("max_text_length", default=256): cv.int_range(min=1, max=1024),
             cv.Optional("queue_size", default=4): cv.int_range(min=1, max=8),
+            cv.Optional("mouse", default=False): cv.boolean,
+            cv.Optional("mouse_click_duration", default="30ms"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(milliseconds=1), max=cv.TimePeriod(seconds=1)),
+            ),
+            cv.Optional("mouse_report_interval", default="8ms"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(milliseconds=1), max=cv.TimePeriod(milliseconds=500)),
+            ),
             cv.Optional("vbus_monitor_pin"): pins.internal_gpio_input_pin_number,
             cv.Optional("usb_vendor_id", default=0x303A): cv.uint16_t,
             cv.Optional("usb_product_id", default=0x4003): cv.uint16_t,
@@ -152,12 +161,19 @@ async def to_code(config):
         )
     )
     cg.add(var.set_layout(getattr(ns.enum("Layout", True), config["layout"])))
+    cg.add(
+        var.set_mouse(
+            config["mouse"],
+            config["mouse_click_duration"].total_milliseconds,
+            config["mouse_report_interval"].total_milliseconds,
+        )
+    )
     cg.add(var.set_usb_ids(config["usb_vendor_id"], config["usb_product_id"]))
     if "vbus_monitor_pin" in config:
         cg.add(var.set_vbus_monitor_pin(config["vbus_monitor_pin"]))
     esp32.add_idf_component(name="espressif/esp_tinyusb", ref="3.0.1")
     for name, value in {
-        "CONFIG_TINYUSB_HID_COUNT": 1,
+        "CONFIG_TINYUSB_HID_COUNT": 2 if config["mouse"] else 1,
         "CONFIG_TINYUSB_SUSPEND_CALLBACK": True,
         "CONFIG_TINYUSB_RESUME_CALLBACK": True,
     }.items():
@@ -190,10 +206,42 @@ automation.register_apply_action(
     cv.Schema({**ID_SCHEMA, cv.Required("text"): cv.templatable(text)}),
     automation.ApplyCall("type(StringRef({}))", (("text", cg.std_string),)),
 )
+MOUSE_BUTTONS = ("LEFT", "RIGHT", "MIDDLE", "BACK", "FORWARD")
+
+
+def mouse_button(value):
+    return cv.one_of(*MOUSE_BUTTONS, upper=True)(value)
+
+
+def mouse_distance(value):
+    return cv.int_range(min=-8000, max=8000)(value)
+
+
+automation.register_apply_action(
+    "hid_keyboard.mouse_move",
+    cv.Schema(
+        {
+            **ID_SCHEMA,
+            cv.Optional("dx", default=0): cv.templatable(mouse_distance),
+            cv.Optional("dy", default=0): cv.templatable(mouse_distance),
+            cv.Optional("wheel", default=0): cv.templatable(mouse_distance),
+        }
+    ),
+    automation.ApplyCall(
+        "mouse_move({}, {}, {})", (("dx", cg.int_), ("dy", cg.int_), ("wheel", cg.int_))
+    ),
+)
+for action in ("press", "release", "click"):
+    automation.register_apply_action(
+        f"hid_keyboard.mouse_{action}",
+        cv.Schema({**ID_SCHEMA, cv.Required("button"): cv.templatable(mouse_button)}),
+        automation.ApplyCall(f"mouse_{action}(StringRef({{}}))", (("button", cg.std_string),)),
+    )
 for condition, method in (
     ("is_connected", "is_connected"),
     ("is_busy", "is_busy"),
     ("last_request_accepted", "last_request_accepted"),
+    ("last_mouse_accepted", "last_mouse_accepted"),
 ):
     automation.register_apply_condition(
         f"hid_keyboard.{condition}", cv.Schema(ID_SCHEMA), f"{method}()"

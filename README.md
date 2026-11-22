@@ -167,3 +167,18 @@ so transport tests cannot silently skip. To run the browser checks manually,
 serve the repository with `mise exec -- uv run -m http.server 8765 --bind 127.0.0.1` and open
 `http://127.0.0.1:8765/home-assistant/tests/`. The preview uses simulated actions
 and sends no keystrokes to a PC.
+
+## Mouse (optional, local addition)
+
+`mouse: true` adds a second USB interface: a relative boot-protocol mouse
+(subclass 1, protocol 2, endpoint 0x82) next to the keyboard, so it also works in
+BIOS/UEFI. Options: `mouse_click_duration` (default 30ms button hold) and
+`mouse_report_interval` (default 8ms between reports).
+
+Actions: `hid_keyboard.mouse_move` (`dx`, `dy`, `wheel`; +x right, +y down,
++wheel up, up to +-8000 each, split into <=127-count steps), and
+`hid_keyboard.mouse_click` / `mouse_press` / `mouse_release` with `button`
+`LEFT`, `RIGHT`, `MIDDLE`, `BACK` or `FORWARD`. `release_all` also releases the
+mouse buttons. `hid_keyboard.last_mouse_accepted` and `last_mouse_message()`
+report the result. Movement is relative only: the host applies its pointer
+acceleration, so distances are not pixel-exact.

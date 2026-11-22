@@ -2,6 +2,7 @@
 
 #include "keyboard_engine.h"
 #include "layouts.h"
+#include "mouse_engine.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
 #include "tinyusb.h"
@@ -23,6 +24,21 @@ class HIDKeyboard : public Component {
     device_descriptor_.idProduct = product;
   }
   void set_vbus_monitor_pin(int pin) { vbus_pin_ = pin; }
+  // Optional relative boot mouse (second HID interface).
+  void set_mouse(bool enabled, uint32_t click_ms, uint32_t gap_ms) {
+    mouse_enabled_ = enabled;
+    mouse_engine_.configure(click_ms, gap_ms);
+    mouse_active_.store(enabled);
+  }
+  void mouse_move(int dx, int dy, int wheel) {
+    mouse_sync_();
+    mouse_accept_(mouse_enabled_ ? mouse_engine_.move(dx, dy, wheel) : Result::UNAVAILABLE);
+  }
+  void mouse_press(StringRef button) { mouse_button_(Op::PRESS, button); }
+  void mouse_release(StringRef button) { mouse_button_(Op::RELEASE, button); }
+  void mouse_click(StringRef button) { mouse_button_(Op::CLICK, button); }
+  bool last_mouse_accepted() const { return mouse_result_ == Result::ACCEPTED; }
+  const char *last_mouse_message() const;
   // Host keyboard layout used to translate text and single-character keys.
   void set_layout(Layout layout) { engine_.set_layout(layout); }
   bool set_layout_name(const std::string &name) {
@@ -43,6 +59,11 @@ class HIDKeyboard : public Component {
     protocol_changed();
     sync_lifecycle_();
     engine_.cancel();
+    if (mouse_enabled_) {
+      mouse_sync_();
+      mouse_observed_epoch_ = mouse_epoch_.load();  // protocol_changed() above must not drop the release report.
+      mouse_engine_.cancel();
+    }
   }
   bool is_connected() const;
   bool is_busy() const { return engine_.busy(); }
@@ -59,9 +80,22 @@ class HIDKeyboard : public Component {
   static void set_idle(uint8_t rate);
   static void set_leds(uint8_t leds);
   static void usb_frame();
+  static void mouse_transfer_complete();
+  static void mouse_transfer_failed();
+  static void mouse_protocol_changed() { mouse_epoch_.fetch_add(1); }
+  static void mouse_frame_();
   static Report snapshot();
 
  protected:
+  enum class Op : uint8_t { PRESS, RELEASE, CLICK };
+  void mouse_sync_();
+  void mouse_loop_();
+  void mouse_accept_(Result result);
+  void mouse_button_(Op op, StringRef button);
+  MouseEngine mouse_engine_;
+  bool mouse_enabled_{false}, mouse_inflight_{false};
+  uint32_t mouse_observed_epoch_{0}, mouse_sent_at_{0};
+  Result mouse_result_{Result::ACCEPTED};
   void sync_lifecycle_();
   void submit_key_(Operation operation, StringRef key, int modifiers) {
     sync_lifecycle_();
@@ -88,7 +122,8 @@ class HIDKeyboard : public Component {
   static std::atomic<uint32_t> generation_, mailbox_, request_generation_, request_report_, snapshot_,
       snapshot_generation_;
   static std::atomic<uint8_t> idle_rate_, leds_;
-  static std::atomic<bool> usb_available_;
+  static std::atomic<bool> usb_available_, mouse_active_;
+  static std::atomic<uint32_t> mouse_mailbox_, mouse_report_, mouse_epoch_, mouse_request_epoch_;
   static uint32_t usb_last_report_at_;  // USB task only
 };
 
