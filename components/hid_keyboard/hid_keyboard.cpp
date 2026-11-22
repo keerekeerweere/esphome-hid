@@ -136,9 +136,19 @@ void HIDKeyboard::build_config_descriptor_() {
   const uint16_t total = TUD_CONFIG_DESC_LEN + interfaces * TUD_HID_DESC_LEN;
   const bool self_powered = vbus_pin_ >= 0;
   uint8_t *out = config_descriptor_;
-  const uint8_t header[] = {TUD_CONFIG_DESCRIPTOR(1, interfaces, 0, total,
-                                                  self_powered ? TUSB_DESC_CONFIG_ATT_SELF_POWERED : 0,
-                                                  self_powered ? 2 : 100)};
+  // Same bytes as TUD_CONFIG_DESCRIPTOR(1, interfaces, 0, total, attribute, power_ma), written out
+  // because the macro narrows its non-constant arguments (compiler warning).
+  const uint8_t attribute = static_cast<uint8_t>(0x80 | (self_powered ? TUSB_DESC_CONFIG_ATT_SELF_POWERED : 0));
+  const uint8_t power_2ma = self_powered ? 1 : 50;  // 2 mA units: 2 mA self-powered, 100 mA bus-powered.
+  const uint8_t header[] = {9,
+                            TUSB_DESC_CONFIGURATION,
+                            static_cast<uint8_t>(total & 0xff),
+                            static_cast<uint8_t>(total >> 8),
+                            interfaces,
+                            1,  // bConfigurationValue
+                            0,  // iConfiguration
+                            attribute,
+                            power_2ma};
   std::memcpy(out, header, sizeof(header));
   out += sizeof(header);
   std::memcpy(out, KEYBOARD_ITF, sizeof(KEYBOARD_ITF));
