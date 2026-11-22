@@ -9,7 +9,7 @@ boot keyboard interface.
 
 - ESP32-S3 board with its native USB device port connected to the target computer.
 - ESPHome 2026.10.0 or newer, using the ESP-IDF framework. Tested with 2026.10.0.
-- US QWERTY keyboard layout on the target computer.
+- Target computer keyboard layout set to one of: `QWERTY_US` (default), `QWERTY_UK`, `AZERTY_BE`, `AZERTY_FR`, `QWERTZ_DE`.
 - Home Assistant with the ESPHome integration for dashboard control; HACS for
   installing the optional dashboard card.
 
@@ -88,7 +88,7 @@ then:
 
 `modifiers` accepts a list, a combination such as `CTRL_ALT`, or an integer mask 0–255. Bits 0–7 are left Ctrl/Shift/Alt/GUI followed by right Ctrl/Shift/Alt/GUI. `CTRL`, `SHIFT`, `ALT`, and `GUI` name left modifiers; `WIN` and `CMD` alias GUI. Lists support explicit side selection, e.g. `[RIGHT_CTRL, LEFT_SHIFT]`. Dynamic out-of-range modifiers are rejected before conversion.
 
-Text accepts printable ASCII plus LF (`\n`, Enter) and tab (`\t`). Unicode, NUL, carriage return, and other control bytes are rejected. An explicit Enter tap avoids accidental submission of a passphrase. Shift and punctuation follow US QWERTY; text letter case compensates for the host-reported Caps Lock LED. The host's UEFI/initramfs/desktop keymap must match, and a host that does not report its lock state must start with Caps Lock off. Single-character `press`/`tap` use the physical US mapping without Caps Lock compensation.
+Text is UTF-8 and is typed through the selected `layout` (set with `layout:` or at runtime with `set_layout_name()`). Characters that need AltGr are sent with Right Alt; dead keys (`^`, `¨`, `` ` ``) are followed by Space. Characters without a key on the layout, invalid UTF-8, NUL, carriage return, and other control bytes reject the whole input; accented letters without their own key are not composed. An explicit Enter tap avoids accidental submission of a passphrase. Shift and punctuation follow the selected layout; text letter case compensates for the host-reported Caps Lock LED. The host's UEFI/initramfs/desktop keymap must match, and a host that does not report its lock state must start with Caps Lock off. Single-character `press`/`tap` resolve through the layout (one key press only) without Caps Lock compensation.
 
 Each press operation replaces the previous held key/modifier combination. Each new request first sends a neutral report, preventing a held modifier from contaminating text. The wire format has six key slots, but the action API intentionally supports one ordinary key at a time plus any modifier combination; it does not accumulate arbitrary multi-key chords.
 

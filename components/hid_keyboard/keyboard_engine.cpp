@@ -1,15 +1,17 @@
 #include "keyboard_engine.h"
+#include "layouts.h"
+#include <utility>
 
 namespace esphome::hid_keyboard {
 
 bool ascii_key(uint8_t c, Key &key) {
   key = {};
   if (c >= 'a' && c <= 'z') {
-    key.code = 4 + c - 'a';
+    key = {static_cast<uint8_t>(4 + c - 'a'), 0, true};
     return true;
   }
   if (c >= 'A' && c <= 'Z') {
-    key = {static_cast<uint8_t>(4 + c - 'A'), 2};
+    key = {static_cast<uint8_t>(4 + c - 'A'), 2, true};
     return true;
   }
   if (c >= '1' && c <= '9') {
@@ -98,11 +100,21 @@ bool named_key(std::string_view name, Key &key) {
 Result KeyboardEngine::submit_key(Operation operation, std::string_view name, uint8_t modifiers) {
   if (!available_) return result_(Result::UNAVAILABLE);
   Key key;
-  if (!named_key(name, key)) return result_(Result::INVALID_INPUT);
+  size_t consumed = 0;
+  uint32_t codepoint = 0;
+  if (!name.empty() && decode_utf8(name, consumed, codepoint) && consumed == name.size()) {
+    // A single character is typed through the layout; it must be one key press.
+    Key keys[2];
+    size_t count = 0;
+    if (!layout_keys(layout_, codepoint, keys, count) || count != 1) return result_(Result::INVALID_INPUT);
+    key = keys[0];
+  } else if (!named_key(name, key)) {
+    return result_(Result::INVALID_INPUT);
+  }
   if (!room_()) return result_(Result::QUEUE_FULL);
   auto &request = back_();
   request.operation = operation;
-  request.key = {key.code, static_cast<uint8_t>(key.modifiers | modifiers)};
+  request.key = {key.code, static_cast<uint8_t>(key.modifiers | modifiers), key.letter};
   count_++;
   return result_(Result::ACCEPTED);
 }
@@ -110,23 +122,33 @@ Result KeyboardEngine::submit_key(Operation operation, std::string_view name, ui
 Result KeyboardEngine::submit_text(std::string_view text) {
   if (!available_) return result_(Result::UNAVAILABLE);
   if (text.size() > max_length_) return result_(Result::TOO_LONG);
-  Key key;
-  for (uint8_t c : text)
-    if (!ascii_key(c, key)) return result_(Result::INVALID_INPUT);
-  if (text.empty()) return result_(Result::ACCEPTED);
+  std::vector<Key> keys;
+  keys.reserve(text.size());
+  for (size_t pos = 0; pos < text.size();) {
+    uint32_t codepoint = 0;
+    Key resolved[2];
+    size_t count = 0;
+    if (!decode_utf8(text, pos, codepoint) || !layout_keys(layout_, codepoint, resolved, count)) {
+      for (auto &k : keys) k = Key{};  // Do not leave partial passphrases behind.
+      return result_(Result::INVALID_INPUT);
+    }
+    keys.insert(keys.end(), resolved, resolved + count);
+  }
+  if (keys.empty()) return result_(Result::ACCEPTED);
+  if (keys.size() > max_length_ * 2) return result_(Result::TOO_LONG);
   if (!room_()) return result_(Result::QUEUE_FULL);
   auto &request = back_();
   request.operation = Operation::TEXT;
-  request.text.assign(text.data(), text.size());  // Copy before API/automation arguments expire.
+  request.keys = std::move(keys);
   count_++;
   return result_(Result::ACCEPTED);
 }
 
 void KeyboardEngine::pop_() {
   // Do not retain passphrases in reusable request strings after completion.
-  auto &text = front_().text;
-  for (volatile char &c : text) c = 0;
-  text.clear();
+  auto &keys = front_().keys;
+  for (auto &k : keys) k = Key{};
+  keys.clear();
   head_ = (head_ + 1) % QUEUE_CAPACITY;
   count_--;
   character_ = 0;
@@ -157,8 +179,8 @@ Key KeyboardEngine::active_key_() const {
   const auto &request = queue_[head_];
   Key key = request.key;
   if (request.operation == Operation::TEXT) {
-    ascii_key(static_cast<uint8_t>(request.text[character_]), key);
-    if (caps_lock_ && key.code >= 4 && key.code <= 0x1d) key.modifiers ^= 2;
+    key = request.keys[character_];
+    if (caps_lock_ && key.letter) key.modifiers ^= 2;
   }
   return key;
 }
@@ -172,7 +194,7 @@ bool KeyboardEngine::next_report(uint32_t now, Report &report) {
   }
   if (stage_ == Stage::HOLD && static_cast<uint32_t>(now - completed_at_) >= press_ms_) stage_ = Stage::RELEASE;
   if (stage_ == Stage::GAP && static_cast<uint32_t>(now - completed_at_) >= gap_ms_) {
-    if (front_().operation == Operation::TEXT && ++character_ < front_().text.size())
+    if (front_().operation == Operation::TEXT && ++character_ < front_().keys.size())
       stage_ = Stage::PRESS;
     else {
       pop_();
