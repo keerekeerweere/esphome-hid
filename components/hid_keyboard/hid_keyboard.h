@@ -42,6 +42,12 @@ class HIDKeyboard : public Component {
   void mouse_press(StringRef button) { mouse_button_(Op::PRESS, button); }
   void mouse_release(StringRef button) { mouse_button_(Op::RELEASE, button); }
   void mouse_click(StringRef button) { mouse_button_(Op::CLICK, button); }
+  // Outcome of the most recent request of any kind (keyboard, mouse or pointer), for
+  // `api.respond:` in actions: success: !lambda return id(kbd).last_ok();
+  bool last_ok() const { return last_was_mouse_ ? mouse_result_ == Result::ACCEPTED : last_request_accepted(); }
+  const char *last_error() const {
+    return last_ok() ? "" : last_was_mouse_ ? last_mouse_message() : last_result_message();
+  }
   bool last_mouse_accepted() const { return mouse_result_ == Result::ACCEPTED; }
   const char *last_mouse_message() const;
   // Host keyboard layout used to translate text and single-character keys.
@@ -126,6 +132,7 @@ class HIDKeyboard : public Component {
   uint8_t config_descriptor_[TUD_CONFIG_DESC_LEN + 3 * TUD_HID_DESC_LEN]{};
   static Channel rel_ch_, abs_ch_;
   Result mouse_result_{Result::ACCEPTED};
+  bool last_was_mouse_{false};
   void sync_lifecycle_();
   void submit_key_(Operation operation, StringRef key, int modifiers) {
     sync_lifecycle_();

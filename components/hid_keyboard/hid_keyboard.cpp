@@ -88,6 +88,7 @@ void HIDKeyboard::sync_lifecycle_() {
 }
 
 void HIDKeyboard::accept_(Result result) {
+  last_was_mouse_ = false;
   if (result != Result::ACCEPTED) ESP_LOGW(TAG, "Keyboard request rejected: %s", last_result_message());
 }
 
@@ -163,6 +164,7 @@ void HIDKeyboard::mouse_sync_() {
 }
 
 void HIDKeyboard::mouse_accept_(Result result) {
+  last_was_mouse_ = true;
   mouse_result_ = result;
   if (result != Result::ACCEPTED) ESP_LOGW(TAG, "Mouse request rejected: %s", last_mouse_message());
 }
